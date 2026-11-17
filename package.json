@@ -1,0 +1,6 @@
+{
+  "name": "doomsday-watcher",
+  "private": true,
+  "type": "module",
+  "scripts": { "once": "node scripts/run.mjs --once" }
+}
