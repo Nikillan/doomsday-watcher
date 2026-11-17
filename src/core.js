@@ -1,6 +1,6 @@
 // Shared logic: reads District's public movie page, finds English Doomsday
 // shows on release day within the radius (or at preferred theatres).
-// No Node-only APIs, so it runs both in a Cloudflare Worker and in Node 18+.
+// Runs in Node 20+ (GitHub Actions).
 
 export const CONFIG = {
   movieSlug: 'avengers-doomsday-movie-tickets-in-chennai-MV176735',
@@ -22,6 +22,46 @@ const HEADERS = {
 
 export function pageUrl(frmtid) {
   return BASE + CONFIG.movieSlug + (frmtid ? `?frmtid=${frmtid}` : '');
+}
+
+// ---- Live data: District's own sessions API, called like an anonymous visitor's browser would.
+// The HTML snapshot (fetchNextData) can be hours stale on seat counts, so prefer this.
+const API = 'https://www.district.in/gw/consumer/movies/v1/movie/sessions';
+let cookieJar = '';
+
+function absorbCookies(res) {
+  const list = typeof res.headers.getSetCookie === 'function' ? res.headers.getSetCookie() : [];
+  if (!list.length) return;
+  const jar = new Map(cookieJar ? cookieJar.split('; ').map((c) => [c.split('=')[0], c]) : []);
+  for (const sc of list) { const kv = sc.split(';')[0]; jar.set(kv.split('=')[0], kv); }
+  cookieJar = [...jar.values()].join('; ');
+}
+
+async function warmSession() {
+  cookieJar = '';
+  const res = await fetch(pageUrl(), { headers: HEADERS, redirect: 'follow' });
+  absorbCookies(res);
+  await res.text();
+}
+
+export const debug = { lastLive: null };
+
+async function fetchLive(frmtid) {
+  const q = new URLSearchParams({
+    version: '3', site_id: '1', channel: 'mweb', child_site_id: '1', platform: 'district',
+    movieCode: frmtid, city_key: 'chennai', content_id: CONFIG.movieSlug.split('-MV')[1],
+    latitude: String(CONFIG.home.lat), longitude: String(CONFIG.home.lon), cinemaOrderLogic: '3',
+  });
+  const call = () => fetch(`${API}?${q}`, {
+    headers: { ...HEADERS, Accept: 'application/json', Referer: pageUrl(frmtid), Cookie: cookieJar },
+  });
+  if (!cookieJar) await warmSession();
+  let res = await call();
+  if (res.status === 401) { await warmSession(); res = await call(); }
+  debug.lastLive = { status: res.status, cookieNames: cookieJar.split('; ').map((c) => c.split('=')[0]).filter(Boolean) };
+  if (!res.ok) throw new Error(`live API ${res.status}`);
+  absorbCookies(res);
+  return res.json(); // { meta: { filterBuckets }, pageData: { nearbyCinemas, farCinemas } }
 }
 
 async function fetchNextData(url) {
@@ -75,11 +115,17 @@ export async function scan() {
   const english = langs.filter((l) => CONFIG.languageMatch.test(l.title));
 
   const shows = [];
+  let source = 'live';
   for (const lang of english) {
-    const data = await fetchNextData(pageUrl(lang.key));
-    const sb = sessionsBlock(data);
-    if (!sb) continue;
-    const pd = sb.block.pageData || {};
+    let pd;
+    try {
+      pd = (await fetchLive(lang.key)).pageData || {};
+    } catch (e) {
+      source = `snapshot (live failed: ${e.message})`;
+      const sb = sessionsBlock(await fetchNextData(pageUrl(lang.key)));
+      if (!sb) continue;
+      pd = sb.block.pageData || {};
+    }
     const cinemas = [...(pd.nearbyCinemas || []), ...(pd.farCinemas || [])];
     for (const c of cinemas) {
       const info = c.cinemaInfo || {};
@@ -109,7 +155,7 @@ export async function scan() {
     }
   }
   shows.sort((a, b) => a.sortKey.localeCompare(b.sortKey));
-  return { shows, languages: langs };
+  return { shows, languages: langs, source };
 }
 
 const esc = (s) => String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
@@ -128,7 +174,7 @@ export function formatShows(shows) {
 export function alertMessage(newShows) {
   const links = [...new Set(newShows.map((s) => s.link))];
   return (
-    `🚨 <b>NEW ${esc(CONFIG.movieName)} SHOWS — Dec 17</b>\n\n` +
+    `🚨 <b>${esc(CONFIG.movieName)} — SEATS AVAILABLE (Dec 17)</b>\n\n` +
     formatShows(newShows) +
     `\n\n👉 Book now: ${links.map(esc).join('\n')}`
   );
@@ -163,30 +209,42 @@ export async function tick(state, notify) {
     return { state, changed: false, result: 'error (suppressed)' };
   }
 
-  const seen = new Set(state.seen || []);
-  const firstRun = !state.seen;
-  const fresh = result.shows.filter((s) => !seen.has(s.id));
+  // avail map: session id -> true (bookable seats) / false (sold out). Alert on new-or-reopened bookable shows.
+  const prev = state.avail || {};
+  const firstRun = !state.avail;
+  const live = result.source === 'live';
+  // Snapshot seat counts can be stale: in that mode only brand-new shows count, known ones keep their last live status.
+  const nowMap = Object.fromEntries(result.shows.map((s) => [s.id, !live && s.id in prev ? prev[s.id] : (s.seatsLeft ?? 1) > 0]));
+  const bookable = result.shows.filter((s) => nowMap[s.id]);
+  const alerted = state.alerted || {};
+  const fresh = bookable.filter((s) => prev[s.id] !== true && Date.now() - (alerted[s.id] || 0) > 10 * 60000);
   let changed = false;
   const next = { ...state };
+  delete next.seen;
 
   if (firstRun) {
+    const soldOut = result.shows.filter((s) => !nowMap[s.id]);
     await notify(
-      `✅ <b>Doomsday watcher is live</b> — checking District every minute for English shows on Dec 17 within ${CONFIG.radiusKm} km of ${CONFIG.home.label} (⭐ = Phoenix / Grand Mall / BSR).\n\n` +
-        (result.shows.length ? `Already open:\n${formatShows(result.shows)}` : 'No English shows open yet.')
+      `✅ <b>Doomsday watcher is live</b> (${esc(result.source)}) — checking every minute for English shows on Dec 17 within ${CONFIG.radiusKm} km of ${CONFIG.home.label} (⭐ = Phoenix / Grand Mall / BSR). You'll be pinged when a new show opens or seats free up in a sold-out one.\n\n` +
+        (bookable.length ? `Bookable now:\n${formatShows(bookable)}\n\n` : 'Nothing bookable right now.\n') +
+        (soldOut.length ? `Sold out: ${soldOut.map((s) => `${esc(s.time)} ${esc(s.cinema.split(',')[0])}`).join('; ')}` : '')
     );
     changed = true;
   } else if (fresh.length) {
-    const msg = alertMessage(fresh);
-    await notify(msg);
-    await notify('⏰ Reminder: new Doomsday shows just opened — book now!');
+    await notify(alertMessage(fresh));
+    next.alerted = { ...alerted, ...Object.fromEntries(fresh.map((s) => [s.id, Date.now()])) };
+    await notify('⏰ Reminder: Doomsday seats available right now — book fast!');
     changed = true;
   }
 
-  if (changed) next.seen = [...new Set([...(state.seen || []), ...result.shows.map((s) => s.id)])];
+  if (changed || JSON.stringify(prev) !== JSON.stringify({ ...prev, ...nowMap })) {
+    next.avail = { ...prev, ...nowMap };
+    changed = true;
+  }
 
   // Daily "still alive" ping after 9 AM IST.
   if (!firstRun && today.hour >= 9 && state.lastHeartbeat !== today.date) {
-    await notify(`💓 Watcher alive. ${result.shows.length} English Dec-17 show(s) in range right now; English versions listed: ${result.languages.filter((l) => CONFIG.languageMatch.test(l.title)).length}.`);
+    await notify(`💓 Watcher alive (${esc(result.source)}). ${result.shows.filter((s) => (s.seatsLeft ?? 1) > 0).length}/${result.shows.length} English Dec-17 show(s) in range bookable; English versions listed: ${result.languages.filter((l) => CONFIG.languageMatch.test(l.title)).length}.`);
     next.lastHeartbeat = today.date;
     changed = true;
   }
