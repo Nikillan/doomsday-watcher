@@ -1,0 +1,36 @@
+# Backup watcher. GitHub cron can't run every minute, so each run loops for
+# ~5h50m checking every 60s, and a new run starts every 6 hours.
+# Use a PUBLIC repo (free unlimited Actions minutes). Secrets: TELEGRAM_TOKEN, TELEGRAM_CHAT_ID.
+name: doomsday-watch
+on:
+  schedule:
+    - cron: '0 */6 * * *'
+  workflow_dispatch:
+concurrency:
+  group: doomsday-watch
+  cancel-in-progress: false
+jobs:
+  watch:
+    runs-on: ubuntu-latest
+    timeout-minutes: 358
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with: { node-version: 20 }
+      - name: Restore state
+        uses: actions/cache/restore@v4
+        with:
+          path: state.json
+          key: watcher-state-${{ github.run_id }}
+          restore-keys: watcher-state-
+      - name: Watch
+        env:
+          TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: node scripts/run.mjs --loop 345
+      - name: Save state
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: state.json
+          key: watcher-state-${{ github.run_id }}
